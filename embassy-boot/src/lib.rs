@@ -29,6 +29,12 @@ pub(crate) const REVERT_MAGIC: u8 = 0xC0;
 pub(crate) const BOOT_MAGIC: u8 = 0xD0;
 pub(crate) const SWAP_MAGIC: u8 = 0xF0;
 pub(crate) const DFU_DETACH_MAGIC: u8 = 0xE0;
+#[cfg(feature = "restore")]
+pub(crate) const BACKUP_MAGIC: u8 = 0xA1;
+#[cfg(feature = "restore")]
+pub(crate) const RECOVER_MAGIC: u8 = 0xB0;
+#[cfg(feature = "safe")]
+pub(crate) const SAFE_MAGIC: u8 = 0xA0;
 
 /// The state of the bootloader after running prepare.
 #[derive(PartialEq, Eq, Debug)]
@@ -36,10 +42,19 @@ pub(crate) const DFU_DETACH_MAGIC: u8 = 0xE0;
 pub enum State {
     /// Bootloader is ready to boot the active partition.
     Boot,
+    /// Bootloader is requested to boot the safe image.
+    #[cfg(feature = "safe")]
+    Safe,
     /// Bootloader has swapped the active partition with the dfu partition and will attempt boot.
     Swap,
     /// Bootloader has reverted the active partition with the dfu partition and will attempt boot.
     Revert,
+    #[cfg(feature = "restore")]
+    /// Bootloader will copy the active partition to the dfu partition as a backup.
+    Backup,
+    #[cfg(feature = "restore")]
+    /// Bootloader will copy the dfu partition to the active partition to recover.
+    Recover,
     /// Application has received a request to reboot into DFU mode to apply an update.
     DfuDetach,
 }
@@ -50,14 +65,35 @@ where
 {
     fn from(magic: T) -> State {
         let magic = magic.as_ref();
+        #[cfg(feature = "safe")]
+        if !magic.iter().any(|&b| b != SAFE_MAGIC) {
+            return State::Safe;
+        }
         if !magic.iter().any(|&b| b != SWAP_MAGIC) {
             State::Swap
         } else if !magic.iter().any(|&b| b != REVERT_MAGIC) {
             State::Revert
-        } else if !magic.iter().any(|&b| b != DFU_DETACH_MAGIC) {
-            State::DfuDetach
         } else {
-            State::Boot
+            #[cfg(feature = "restore")]
+            {
+                if !magic.iter().any(|&b| b != BACKUP_MAGIC) {
+                    State::Backup
+                } else if !magic.iter().any(|&b| b != RECOVER_MAGIC) {
+                    State::Recover
+                } else if !magic.iter().any(|&b| b != DFU_DETACH_MAGIC) {
+                    State::DfuDetach
+                } else {
+                    State::Boot
+                }
+            }
+            #[cfg(not(feature = "restore"))]
+            {
+                if !magic.iter().any(|&b| b != DFU_DETACH_MAGIC) {
+                    State::DfuDetach
+                } else {
+                    State::Boot
+                }
+            }
         }
     }
 }
@@ -82,6 +118,7 @@ impl<const N: usize> AsMut<[u8]> for AlignedBuffer<N> {
 mod tests {
     #![allow(unused_imports)]
 
+    use core::marker::PhantomData;
     use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
     use embedded_storage_async::nor_flash::NorFlash as AsyncNorFlash;
     use futures::executor::block_on;
@@ -90,6 +127,7 @@ mod tests {
     use crate::boot_loader::BootLoaderConfig;
     use crate::firmware_updater::FirmwareUpdaterConfig;
     use crate::mem_flash::MemFlash;
+    #[cfg(not(feature = "safe"))]
     use crate::test_flash::{AsyncTestFlash, BlockingTestFlash};
 
     /*
@@ -108,11 +146,16 @@ mod tests {
     */
 
     #[test]
+    #[cfg(not(feature = "safe"))]
     fn test_boot_state() {
         let flash = BlockingTestFlash::new(BootLoaderConfig {
             active: MemFlash::<57344, 4096, 4>::default(),
             dfu: MemFlash::<61440, 4096, 4>::default(),
+            #[cfg(feature = "reset-check")]
+            state: MemFlash::<8192, 4096, 4>::default(),
+            #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
+            _marker: PhantomData::<()>,
         });
 
         flash.state().write(0, &[BOOT_MAGIC; 4]).unwrap();
@@ -121,6 +164,7 @@ mod tests {
             active: flash.active(),
             dfu: flash.dfu(),
             state: flash.state(),
+            _marker: PhantomData::<()>,
         });
 
         let mut page = [0; 4096];
@@ -128,13 +172,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "_verify"))]
+    #[cfg(all(not(feature = "safe"), not(feature = "_verify")))]
     fn test_swap_state() {
         const FIRMWARE_SIZE: usize = 57344;
         let flash = AsyncTestFlash::new(BootLoaderConfig {
             active: MemFlash::<FIRMWARE_SIZE, 4096, 4>::default(),
             dfu: MemFlash::<61440, 4096, 4>::default(),
+            #[cfg(feature = "reset-check")]
+            state: MemFlash::<8192, 4096, 4>::default(),
+            #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
+            _marker: PhantomData::<()>,
         });
 
         const ORIGINAL: [u8; FIRMWARE_SIZE] = [0x55; FIRMWARE_SIZE];
@@ -163,6 +211,7 @@ mod tests {
             active: flash.active(),
             dfu: flash.dfu(),
             state: flash.state(),
+            _marker: PhantomData::<()>,
         });
 
         let mut page = [0; 1024];
@@ -204,18 +253,20 @@ mod tests {
             active: flash.active(),
             dfu: flash.dfu(),
             state: flash.state(),
+            _marker: PhantomData::<()>,
         });
         assert_eq!(State::Boot, bootloader.prepare_boot(&mut page).unwrap());
     }
 
     #[test]
-    #[cfg(not(feature = "_verify"))]
+    #[cfg(all(not(feature = "safe"), not(feature = "_verify")))]
     fn test_swap_state_active_page_biggest() {
         const FIRMWARE_SIZE: usize = 12288;
         let flash = AsyncTestFlash::new(BootLoaderConfig {
             active: MemFlash::<12288, 4096, 8>::random(),
             dfu: MemFlash::<16384, 2048, 8>::random(),
             state: MemFlash::<2048, 128, 4>::random(),
+            _marker: PhantomData::<()>,
         });
 
         const ORIGINAL: [u8; FIRMWARE_SIZE] = [0x55; FIRMWARE_SIZE];
@@ -240,6 +291,7 @@ mod tests {
             active: flash.active(),
             dfu: flash.dfu(),
             state: flash.state(),
+            _marker: PhantomData::<()>,
         });
 
         let mut page = [0; 4096];
@@ -254,13 +306,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "_verify"))]
+    #[cfg(all(not(feature = "safe"), not(feature = "_verify")))]
     fn test_swap_state_dfu_page_biggest() {
         const FIRMWARE_SIZE: usize = 12288;
         let flash = AsyncTestFlash::new(BootLoaderConfig {
             active: MemFlash::<FIRMWARE_SIZE, 2048, 4>::random(),
             dfu: MemFlash::<16384, 4096, 8>::random(),
             state: MemFlash::<2048, 128, 4>::random(),
+            _marker: PhantomData::<()>,
         });
 
         const ORIGINAL: [u8; FIRMWARE_SIZE] = [0x55; FIRMWARE_SIZE];
@@ -285,6 +338,7 @@ mod tests {
             active: flash.active(),
             dfu: flash.dfu(),
             state: flash.state(),
+            _marker: PhantomData::<()>,
         });
         let mut page = [0; 4096];
         assert_eq!(State::Swap, bootloader.prepare_boot(&mut page).unwrap());
@@ -298,7 +352,89 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "restore")]
+    fn test_backup() {
+        const SIZE: usize = 8192;
+        let flash = AsyncTestFlash::new(BootLoaderConfig {
+            active: MemFlash::<SIZE, 4096, 4>::default(),
+            dfu: MemFlash::<12288, 4096, 4>::default(),
+            state: MemFlash::<4096, 4096, 4>::default(),
+        });
+
+        const ACTIVE_DATA: [u8; SIZE] = [0x11; SIZE];
+        let mut aligned = [0; 4];
+
+        block_on(flash.active().erase(0, SIZE as u32)).unwrap();
+        block_on(flash.active().write(0, &ACTIVE_DATA)).unwrap();
+
+        let mut updater = FirmwareUpdater::new(
+            FirmwareUpdaterConfig {
+                dfu: flash.dfu(),
+                state: flash.state(),
+            },
+            &mut aligned,
+        );
+        block_on(updater.mark_backup()).unwrap();
+
+        let flash = flash.into_blocking();
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: flash.active(),
+            dfu: flash.dfu(),
+            state: flash.state(),
+        });
+        let mut page = [0; 4096];
+        assert_eq!(State::Boot, bootloader.prepare_boot(&mut page).unwrap());
+
+        let mut buf = [0; SIZE];
+        flash.dfu().read(0, &mut buf).unwrap();
+        assert_eq!(ACTIVE_DATA, buf);
+    }
+
+    #[test]
+    #[cfg(feature = "restore")]
+    fn test_recover() {
+        const SIZE: usize = 8192;
+        let flash = AsyncTestFlash::new(BootLoaderConfig {
+            active: MemFlash::<SIZE, 4096, 4>::default(),
+            dfu: MemFlash::<12288, 4096, 4>::default(),
+            state: MemFlash::<4096, 4096, 4>::default(),
+        });
+
+        const ACTIVE_DATA: [u8; SIZE] = [0x11; SIZE];
+        const BACKUP_DATA: [u8; SIZE] = [0x22; SIZE];
+        let mut aligned = [0; 4];
+
+        block_on(flash.active().erase(0, SIZE as u32)).unwrap();
+        block_on(flash.active().write(0, &ACTIVE_DATA)).unwrap();
+        block_on(flash.dfu().erase(0, 12288u32)).unwrap();
+        block_on(flash.dfu().write(0, &BACKUP_DATA)).unwrap();
+
+        let mut updater = FirmwareUpdater::new(
+            FirmwareUpdaterConfig {
+                dfu: flash.dfu(),
+                state: flash.state(),
+            },
+            &mut aligned,
+        );
+        block_on(updater.mark_recover()).unwrap();
+
+        let flash = flash.into_blocking();
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: flash.active(),
+            dfu: flash.dfu(),
+            state: flash.state(),
+        });
+        let mut page = [0; 4096];
+        assert_eq!(State::Boot, bootloader.prepare_boot(&mut page).unwrap());
+
+        let mut buf = [0; SIZE];
+        flash.active().read(0, &mut buf).unwrap();
+        assert_eq!(BACKUP_DATA, buf);
+    }
+
+    #[test]
     #[cfg(feature = "_verify")]
+    #[cfg(all(feature = "_verify", not(feature = "safe")))]
     fn test_verify() {
         // The following key setup is based on:
         // https://docs.rs/ed25519-dalek/latest/ed25519_dalek/#example
@@ -321,7 +457,11 @@ mod tests {
         let flash = BlockingTestFlash::new(BootLoaderConfig {
             active: MemFlash::<0, 0, 0>::default(),
             dfu: MemFlash::<4096, 4096, 4>::default(),
+            #[cfg(feature = "reset-check")]
+            state: MemFlash::<8192, 4096, 4>::default(),
+            #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
+            _marker: PhantomData::<()>,
         });
 
         let firmware_len = firmware.len();
@@ -347,5 +487,95 @@ mod tests {
             firmware_len as u32,
         ))
         .is_ok());
+    }
+
+    #[cfg(feature = "safe")]
+    #[no_mangle]
+    static mut __bootloader_safe_flag: u8 = 0;
+
+    #[test]
+    #[cfg(feature = "safe")]
+    fn test_safe_flag_triggers_safe_state() {
+        use crate::SAFE_MAGIC;
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: MemFlash::<4096, 4096, 4>::default(),
+            dfu: MemFlash::<8192, 4096, 4>::default(),
+            state: MemFlash::<4096, 4096, 4>::default(),
+            safe: MemFlash::<4096, 4096, 4>::default(),
+        });
+
+        unsafe {
+            core::ptr::write_volatile(&mut __bootloader_safe_flag, 1);
+        }
+
+        let mut page = [0; 4096];
+        assert_eq!(State::Safe, bootloader.prepare_boot(&mut page).unwrap());
+
+        unsafe {
+            core::ptr::write_volatile(&mut __bootloader_safe_flag, 0);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "safe")]
+    fn test_safe_magic_triggers_safe_state() {
+        let mut state = MemFlash::<4096, 4096, 4>::default();
+        embedded_storage::nor_flash::NorFlash::write(&mut state, 0, &[SAFE_MAGIC; 4]).unwrap();
+
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: MemFlash::<4096, 4096, 4>::default(),
+            dfu: MemFlash::<8192, 4096, 4>::default(),
+            state,
+            safe: MemFlash::<4096, 4096, 4>::default(),
+        });
+
+        let mut page = [0; 4096];
+        assert_eq!(State::Safe, bootloader.prepare_boot(&mut page).unwrap());
+    }
+
+    #[test]
+    #[cfg(feature = "safe")]
+    fn test_safe_feature_without_flag_or_magic_boots_normally() {
+        let mut state = MemFlash::<4096, 4096, 4>::default();
+        embedded_storage::nor_flash::NorFlash::write(&mut state, 0, &[BOOT_MAGIC; 4]).unwrap();
+
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: MemFlash::<4096, 4096, 4>::default(),
+            dfu: MemFlash::<8192, 4096, 4>::default(),
+            state,
+            safe: MemFlash::<4096, 4096, 4>::default(),
+        });
+
+        let mut page = [0; 4096];
+        assert_eq!(State::Boot, bootloader.prepare_boot(&mut page).unwrap());
+    }
+    #[cfg(feature = "reset-check")]
+    #[test]
+    fn test_reset_counter() {
+        let flash = BlockingTestFlash::new(BootLoaderConfig {
+            active: MemFlash::<4096, 4096, 4>::default(),
+            dfu: MemFlash::<8192, 4096, 4>::default(),
+            #[cfg(feature = "reset-check")]
+            state: MemFlash::<8192, 4096, 4>::default(),
+            #[cfg(not(feature = "reset-check"))]
+            state: MemFlash::<4096, 4096, 4>::default(),
+        });
+
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: flash.active(),
+            dfu: flash.dfu(),
+            state: flash.state(),
+        });
+
+        let mut aligned = [0; 4];
+        bootloader.prepare_boot(&mut aligned).unwrap();
+        assert_eq!(1, bootloader.read_reset_count(&mut aligned).unwrap());
+
+        bootloader.prepare_boot(&mut aligned).unwrap();
+        assert_eq!(2, bootloader.read_reset_count(&mut aligned).unwrap());
+
+        let mut state = BlockingFirmwareState::new(flash.state(), &mut aligned);
+        state.clear_reset_count().unwrap();
+        assert_eq!(0, state.read_reset_count().unwrap());
     }
 }

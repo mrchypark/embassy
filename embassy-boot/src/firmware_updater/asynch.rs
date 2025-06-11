@@ -7,6 +7,8 @@ use embedded_storage_async::nor_flash::NorFlash;
 
 use super::FirmwareUpdaterConfig;
 use crate::{FirmwareUpdaterError, State, BOOT_MAGIC, DFU_DETACH_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC};
+#[cfg(feature = "restore")]
+use crate::{BACKUP_MAGIC, RECOVER_MAGIC};
 
 /// FirmwareUpdater is an application API for interacting with the BootLoader without the ability to
 /// 'mess up' the internal bootloader state
@@ -184,6 +186,20 @@ impl<'d, DFU: NorFlash, STATE: NorFlash> FirmwareUpdater<'d, DFU, STATE> {
         self.state.mark_dfu().await
     }
 
+    /// Mark to trigger a backup of the active partition on next boot.
+    #[cfg(feature = "restore")]
+    pub async fn mark_backup(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.state.verify_booted().await?;
+        self.state.mark_backup().await
+    }
+
+    /// Mark to trigger restore from the DFU partition on next boot.
+    #[cfg(feature = "restore")]
+    pub async fn mark_recover(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.state.verify_booted().await?;
+        self.state.mark_recover().await
+    }
+
     /// Mark firmware boot successful and stop rollback on reset.
     pub async fn mark_booted(&mut self) -> Result<(), FirmwareUpdaterError> {
         self.state.mark_booted().await
@@ -333,6 +349,65 @@ impl<'d, STATE: NorFlash> FirmwareState<'d, STATE> {
         self.set_magic(BOOT_MAGIC).await
     }
 
+    /// Mark to trigger a backup of the active partition on next boot.
+    #[cfg(feature = "restore")]
+    pub async fn mark_backup(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.set_magic(BACKUP_MAGIC).await
+    }
+
+    /// Mark to trigger restore from the DFU partition on next boot.
+    #[cfg(feature = "restore")]
+    pub async fn mark_recover(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.set_magic(RECOVER_MAGIC).await
+    }
+
+    /// Read the reset counter stored in flash.
+    #[cfg(feature = "reset-check")]
+    pub async fn read_reset_count(&mut self) -> Result<u32, FirmwareUpdaterError> {
+        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
+        self.state.read(offset, &mut self.aligned).await?;
+        let bytes = core::cmp::min(STATE::WRITE_SIZE, 4);
+        if self.aligned[..bytes].iter().all(|&b| b == STATE_ERASE_VALUE) {
+            return Ok(0);
+        }
+        let mut tmp = [0u8; 4];
+        tmp[..bytes].copy_from_slice(&self.aligned[..bytes]);
+        Ok(u32::from_le_bytes(tmp))
+    }
+
+    /// Increment the reset counter.
+    #[cfg(feature = "reset-check")]
+    pub async fn increment_reset_count(&mut self) -> Result<u32, FirmwareUpdaterError> {
+        let mut count = self.read_reset_count().await?;
+        count = count.wrapping_add(1);
+        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
+        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
+        self.state
+            .erase(page_start, page_start + STATE::ERASE_SIZE as u32)
+            .await?;
+
+        self.aligned.fill(0);
+        let bytes = count.to_le_bytes();
+        let copy = core::cmp::min(STATE::WRITE_SIZE, 4);
+        self.aligned[..copy].copy_from_slice(&bytes[..copy]);
+        self.state.write(offset, &self.aligned[..STATE::WRITE_SIZE]).await?;
+        Ok(count)
+    }
+
+    /// Clear the reset counter to zero.
+    #[cfg(feature = "reset-check")]
+    pub async fn clear_reset_count(&mut self) -> Result<(), FirmwareUpdaterError> {
+        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
+        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
+        self.state
+            .erase(page_start, page_start + STATE::ERASE_SIZE as u32)
+            .await?;
+
+        self.aligned.fill(0);
+        self.state.write(offset, &self.aligned[..STATE::WRITE_SIZE]).await?;
+        Ok(())
+    }
+
     async fn set_magic(&mut self, magic: u8) -> Result<(), FirmwareUpdaterError> {
         self.state.read(0, &mut self.aligned).await?;
 
@@ -358,6 +433,11 @@ impl<'d, STATE: NorFlash> FirmwareState<'d, STATE> {
             }
 
             // Clear magic and progress
+            #[cfg(feature = "reset-check")]
+            self.state
+                .erase(0, self.state.capacity() as u32 - STATE::ERASE_SIZE as u32)
+                .await?;
+            #[cfg(not(feature = "reset-check"))]
             self.state.erase(0, self.state.capacity() as u32).await?;
 
             // Set magic

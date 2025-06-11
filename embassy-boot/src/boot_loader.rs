@@ -1,11 +1,39 @@
 use core::cell::RefCell;
+use core::marker::PhantomData;
 
 use embassy_embedded_hal::flash::partition::BlockingPartition;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
 
-use crate::{State, DFU_DETACH_MAGIC, REVERT_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC};
+use crate::{State, BOOT_MAGIC, DFU_DETACH_MAGIC, REVERT_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC};
+#[cfg(feature = "restore")]
+use crate::{BACKUP_MAGIC, RECOVER_MAGIC};
+
+/// Progress markers per page for each operation.
+const SWAP_PROGRESS_MARKS_PER_PAGE: u32 = 2;
+const REVERT_PROGRESS_MARKS_PER_PAGE: u32 = 2;
+#[cfg(feature = "restore")]
+const BACKUP_PROGRESS_MARKS_PER_PAGE: u32 = 1;
+#[cfg(feature = "restore")]
+const RECOVER_PROGRESS_MARKS_PER_PAGE: u32 = 1;
+
+/// Base multipliers for calculating progress index slots within the state partition.
+const SWAP_PROGRESS_BASE: u32 = 0;
+const REVERT_PROGRESS_BASE: u32 = SWAP_PROGRESS_BASE + SWAP_PROGRESS_MARKS_PER_PAGE;
+#[cfg(feature = "restore")]
+const BACKUP_PROGRESS_BASE: u32 = REVERT_PROGRESS_BASE + REVERT_PROGRESS_MARKS_PER_PAGE;
+#[cfg(feature = "restore")]
+const RECOVER_PROGRESS_BASE: u32 = BACKUP_PROGRESS_BASE + BACKUP_PROGRESS_MARKS_PER_PAGE;
+#[cfg(not(feature = "restore"))]
+const TOTAL_PROGRESS_MARKS_PER_PAGE: u32 = SWAP_PROGRESS_MARKS_PER_PAGE + REVERT_PROGRESS_MARKS_PER_PAGE;
+#[cfg(feature = "restore")]
+const TOTAL_PROGRESS_MARKS_PER_PAGE: u32 = SWAP_PROGRESS_MARKS_PER_PAGE
+    + REVERT_PROGRESS_MARKS_PER_PAGE
+    + BACKUP_PROGRESS_MARKS_PER_PAGE
+    + RECOVER_PROGRESS_MARKS_PER_PAGE;
+#[cfg(feature = "safe")]
+use crate::SAFE_MAGIC;
 
 /// Errors returned by bootloader
 #[derive(PartialEq, Eq, Debug)]
@@ -35,20 +63,49 @@ where
     }
 }
 
+/// Create a `BlockingPartition` from linker-provided start and end symbols.
+///
+/// This helper reduces boilerplate in `from_linkerfile_blocking` by taking a
+/// flash reference and the start/end symbols for a partition and returning a
+/// configured `BlockingPartition`. The `name` argument is used only for trace
+/// logging so developers can verify the partition layout.
+fn partition_from_symbols<'a, F: NorFlash>(
+    flash: &'a Mutex<NoopRawMutex, RefCell<F>>,
+    start: &'static u32,
+    end: &'static u32,
+    name: &str,
+) -> BlockingPartition<'a, NoopRawMutex, F> {
+    unsafe {
+        let start = start as *const u32 as u32;
+        let end = end as *const u32 as u32;
+        trace!("{}: 0x{:x} - 0x{:x}", name, start, end);
+        BlockingPartition::new(flash, start, end - start)
+    }
+}
+
 /// Bootloader flash configuration holding the three flashes used by the bootloader
 ///
 /// If only a single flash is actually used, then that flash should be partitioned into three partitions before use.
 /// The easiest way to do this is to use [`BootLoaderConfig::from_linkerfile_blocking`] which will partition
-/// the provided flash according to symbols defined in the linkerfile.
-pub struct BootLoaderConfig<ACTIVE, DFU, STATE> {
+/// the provided flash according to symbols defined in the linkerfile. When the
+/// `safe` feature is enabled, a fourth partition holds a fallback firmware image
+/// that can be booted if the application requests a safe boot.
+pub struct BootLoaderConfig<ACTIVE, DFU, STATE, SAFE = ()> {
     /// Flash type used for the active partition - the partition which will be booted from.
     pub active: ACTIVE,
     /// Flash type used for the dfu partition - the partition which will be swapped in when requested.
     pub dfu: DFU,
     /// Flash type used for the state partition.
     pub state: STATE,
+    /// Flash type used for the safe partition.
+    #[cfg(feature = "safe")]
+    pub safe: SAFE,
+    #[cfg(not(feature = "safe"))]
+    /// Marker field present when the `safe` feature is disabled.
+    pub _marker: PhantomData<SAFE>,
 }
 
+#[cfg(not(feature = "safe"))]
 impl<'a, ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash>
     BootLoaderConfig<
         BlockingPartition<'a, NoopRawMutex, ACTIVE>,
@@ -104,33 +161,85 @@ impl<'a, ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash>
         }
 
         let active = unsafe {
-            let start = &__bootloader_active_start as *const u32 as u32;
-            let end = &__bootloader_active_end as *const u32 as u32;
-            trace!("ACTIVE: 0x{:x} - 0x{:x}", start, end);
-
-            BlockingPartition::new(active_flash, start, end - start)
+            partition_from_symbols(
+                active_flash,
+                &__bootloader_active_start,
+                &__bootloader_active_end,
+                "ACTIVE",
+            )
         };
-        let dfu = unsafe {
-            let start = &__bootloader_dfu_start as *const u32 as u32;
-            let end = &__bootloader_dfu_end as *const u32 as u32;
-            trace!("DFU: 0x{:x} - 0x{:x}", start, end);
+        let dfu = unsafe { partition_from_symbols(dfu_flash, &__bootloader_dfu_start, &__bootloader_dfu_end, "DFU") };
+        let state =
+            unsafe { partition_from_symbols(state_flash, &__bootloader_state_start, &__bootloader_state_end, "STATE") };
 
-            BlockingPartition::new(dfu_flash, start, end - start)
-        };
-        let state = unsafe {
-            let start = &__bootloader_state_start as *const u32 as u32;
-            let end = &__bootloader_state_end as *const u32 as u32;
-            trace!("STATE: 0x{:x} - 0x{:x}", start, end);
-
-            BlockingPartition::new(state_flash, start, end - start)
-        };
-
-        Self { active, dfu, state }
+        Self {
+            active,
+            dfu,
+            state,
+            _marker: PhantomData,
+        }
     }
 }
 
-/// BootLoader works with any flash implementing embedded_storage.
-pub struct BootLoader<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> {
+#[cfg(feature = "safe")]
+impl<'a, ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE: NorFlash>
+    BootLoaderConfig<
+        BlockingPartition<'a, NoopRawMutex, ACTIVE>,
+        BlockingPartition<'a, NoopRawMutex, DFU>,
+        BlockingPartition<'a, NoopRawMutex, STATE>,
+        BlockingPartition<'a, NoopRawMutex, SAFE>,
+    >
+{
+    /// Constructs a `BootLoaderConfig` instance from flash memory and address symbols defined in the linker file.
+    pub fn from_linkerfile_blocking(
+        active_flash: &'a Mutex<NoopRawMutex, RefCell<ACTIVE>>,
+        dfu_flash: &'a Mutex<NoopRawMutex, RefCell<DFU>>,
+        state_flash: &'a Mutex<NoopRawMutex, RefCell<STATE>>,
+        // Flash containing the safe image referenced when a safe boot is requested.
+        safe_flash: &'a Mutex<NoopRawMutex, RefCell<SAFE>>,
+    ) -> Self {
+        extern "C" {
+            static __bootloader_state_start: u32;
+            static __bootloader_state_end: u32;
+            static __bootloader_active_start: u32;
+            static __bootloader_active_end: u32;
+            static __bootloader_dfu_start: u32;
+            static __bootloader_dfu_end: u32;
+            // These symbols must be provided by the linker script and define
+            // the start and end addresses of the safe partition.
+            static __bootloader_safe_start: u32;
+            static __bootloader_safe_end: u32;
+        }
+
+        let active = unsafe {
+            partition_from_symbols(
+                active_flash,
+                &__bootloader_active_start,
+                &__bootloader_active_end,
+                "ACTIVE",
+            )
+        };
+        let dfu = unsafe { partition_from_symbols(dfu_flash, &__bootloader_dfu_start, &__bootloader_dfu_end, "DFU") };
+        let state =
+            unsafe { partition_from_symbols(state_flash, &__bootloader_state_start, &__bootloader_state_end, "STATE") };
+        let safe =
+            unsafe { partition_from_symbols(safe_flash, &__bootloader_safe_start, &__bootloader_safe_end, "SAFE") };
+        Self {
+            active,
+            dfu,
+            state,
+            safe,
+        }
+    }
+}
+
+/// BootLoader works with any flash implementing `embedded_storage`.
+///
+/// When the `safe` feature is enabled, an additional flash partition is used as
+/// a fallback image in case of boot failure. The bootloader checks the
+/// `__bootloader_safe_flag` linker symbol and the state partition for
+/// `SAFE_MAGIC` to decide whether to boot this image.
+pub struct BootLoader<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE = ()> {
     active: ACTIVE,
     dfu: DFU,
     /// The state partition has the following format:
@@ -138,11 +247,20 @@ pub struct BootLoader<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> {
     /// | Range    | Description                                                                      |
     /// | 0..1     | Magic indicating bootloader state. BOOT_MAGIC means boot, SWAP_MAGIC means swap. |
     /// | 1..2     | Progress validity. ERASE_VALUE means valid, !ERASE_VALUE means invalid.          |
-    /// | 2..2 + N | Progress index used while swapping or reverting      
+    /// | 2..2 + N | Progress index used while swapping or reverting
+    #[cfg_attr(
+        feature = "reset-check",
+        doc = "| last-1..last | Reset count incremented on every boot"
+    )]
     state: STATE,
+    #[cfg(feature = "safe")]
+    safe: SAFE,
+    #[cfg(not(feature = "safe"))]
+    /// Marker field present when the `safe` feature is disabled.
+    _marker: PhantomData<SAFE>,
 }
 
-impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, STATE> {
+impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, DFU, STATE, SAFE> {
     /// Get the page size which is the "unit of operation" within the bootloader.
     const PAGE_SIZE: u32 = if ACTIVE::ERASE_SIZE > DFU::ERASE_SIZE {
         ACTIVE::ERASE_SIZE as u32
@@ -154,11 +272,16 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
     ///
     /// - All partitions must be aligned with the PAGE_SIZE const generic parameter.
     /// - The dfu partition must be at least PAGE_SIZE bigger than the active partition.
-    pub fn new(config: BootLoaderConfig<ACTIVE, DFU, STATE>) -> Self {
+    /// - When the `safe` feature is enabled, the `safe` partition holds a fallback image.
+    pub fn new(config: BootLoaderConfig<ACTIVE, DFU, STATE, SAFE>) -> Self {
         Self {
             active: config.active,
             dfu: config.dfu,
             state: config.state,
+            #[cfg(feature = "safe")]
+            safe: config.safe,
+            #[cfg(not(feature = "safe"))]
+            _marker: PhantomData,
         }
     }
 
@@ -251,8 +374,15 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
         // Ensure our partitions are able to handle boot operations
         assert_partitions(&self.active, &self.dfu, &self.state, Self::PAGE_SIZE);
 
+        #[cfg(feature = "reset-check")]
+        self.increment_reset_count(aligned_buf)?;
+
         // Copy contents from partition N to active
         let state = self.read_state(aligned_buf)?;
+        #[cfg(feature = "safe")]
+        if Self::safe_requested() {
+            return Ok(State::Safe);
+        }
         if state == State::Swap {
             //
             // Check if we already swapped. If we're in the swap state, this means we should revert
@@ -272,13 +402,32 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
                 state_word.fill(!STATE_ERASE_VALUE);
                 self.state.write(STATE::WRITE_SIZE as u32, state_word)?;
 
-                // Clear magic and progress
+                #[cfg(feature = "reset-check")]
+                self.state
+                    .erase(0, self.state.capacity() as u32 - STATE::ERASE_SIZE as u32)?;
+                #[cfg(not(feature = "reset-check"))]
                 self.state.erase(0, self.state.capacity() as u32)?;
 
                 // Set magic
                 state_word.fill(REVERT_MAGIC);
                 self.state.write(0, state_word)?;
             }
+        }
+        #[cfg(feature = "restore")]
+        match state {
+            State::Backup => {
+                trace!("Backing up active partition");
+                self.backup(aligned_buf)?;
+                self.finalize(BOOT_MAGIC, aligned_buf)?;
+                return Ok(State::Boot);
+            }
+            State::Recover => {
+                trace!("Recovering active partition");
+                self.recover(aligned_buf)?;
+                self.finalize(BOOT_MAGIC, aligned_buf)?;
+                return Ok(State::Boot);
+            }
+            _ => {}
         }
         Ok(state)
     }
@@ -292,7 +441,17 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
 
     fn current_progress(&mut self, aligned_buf: &mut [u8]) -> Result<usize, BootError> {
         let write_size = STATE::WRITE_SIZE as u32;
-        let max_index = ((self.state.capacity() - STATE::WRITE_SIZE) / STATE::WRITE_SIZE) - 2;
+        let reserved = {
+            #[cfg(feature = "reset-check")]
+            {
+                STATE::ERASE_SIZE
+            }
+            #[cfg(not(feature = "reset-check"))]
+            {
+                0
+            }
+        };
+        let max_index = ((self.state.capacity() - reserved) / STATE::WRITE_SIZE) - 2;
         let state_word = &mut aligned_buf[..write_size as usize];
 
         self.state.read(write_size, state_word)?;
@@ -304,7 +463,7 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
         for index in 0..max_index {
             self.state.read((2 + index) as u32 * write_size, state_word)?;
 
-            if state_word.iter().any(|&b| b == STATE_ERASE_VALUE) {
+            if state_word.contains(&STATE_ERASE_VALUE) {
                 return Ok(index);
             }
         }
@@ -317,6 +476,19 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
         self.state
             .write((2 + progress_index) as u32 * STATE::WRITE_SIZE as u32, state_word)?;
         Ok(())
+    }
+
+    #[cfg(feature = "safe")]
+    fn safe_requested() -> bool {
+        extern "C" {
+            // Linker symbol that should reside in a `.bss` or `.noinit` section.
+            // When non-zero, the bootloader will attempt a safe boot using the
+            // image in the safe partition. Applications are responsible for
+            // clearing the flag after use.
+            static __bootloader_safe_flag: u8;
+        }
+
+        unsafe { core::ptr::read_volatile(&__bootloader_safe_flag) != 0 }
     }
 
     fn copy_page_once_to_active(
@@ -366,7 +538,7 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
     fn swap(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
         let page_count = self.active.capacity() as u32 / Self::PAGE_SIZE;
         for page_num in 0..page_count {
-            let progress_index = (page_num * 2) as usize;
+            let progress_index = (page_count * SWAP_PROGRESS_BASE + page_num * SWAP_PROGRESS_MARKS_PER_PAGE) as usize;
 
             // Copy active page to the 'next' DFU page.
             let active_from_offset = (page_count - 1 - page_num) * Self::PAGE_SIZE;
@@ -387,7 +559,8 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
     fn revert(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
         let page_count = self.active.capacity() as u32 / Self::PAGE_SIZE;
         for page_num in 0..page_count {
-            let progress_index = (page_count * 2 + page_num * 2) as usize;
+            let progress_index =
+                (page_count * REVERT_PROGRESS_BASE + page_num * REVERT_PROGRESS_MARKS_PER_PAGE) as usize;
 
             // Copy the bad active page to the DFU page
             let active_from_offset = page_num * Self::PAGE_SIZE;
@@ -403,19 +576,130 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash> BootLoader<ACTIVE, DFU, S
         Ok(())
     }
 
+    #[cfg(feature = "restore")]
+    fn backup(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
+        let page_count = self.active.capacity() as u32 / Self::PAGE_SIZE;
+        for page_num in 0..page_count {
+            let progress_index =
+                (page_count * BACKUP_PROGRESS_BASE + page_num * BACKUP_PROGRESS_MARKS_PER_PAGE) as usize;
+            let offset = page_num * Self::PAGE_SIZE;
+            self.copy_page_once_to_dfu(progress_index, offset, offset, aligned_buf)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "restore")]
+    fn recover(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
+        let page_count = self.active.capacity() as u32 / Self::PAGE_SIZE;
+        for page_num in 0..page_count {
+            let progress_index =
+                (page_count * RECOVER_PROGRESS_BASE + page_num * RECOVER_PROGRESS_MARKS_PER_PAGE) as usize;
+            let offset = page_num * Self::PAGE_SIZE;
+            self.copy_page_once_to_active(progress_index, offset, offset, aligned_buf)?;
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self, magic: u8, aligned_buf: &mut [u8]) -> Result<(), BootError> {
+        let state_word = &mut aligned_buf[..STATE::WRITE_SIZE];
+
+        // Invalidate progress
+        state_word.fill(!STATE_ERASE_VALUE);
+        self.state.write(STATE::WRITE_SIZE as u32, state_word)?;
+
+        // Clear magic and progress
+        #[cfg(feature = "reset-check")]
+        self.state
+            .erase(0, self.state.capacity() as u32 - STATE::ERASE_SIZE as u32)?;
+        #[cfg(not(feature = "reset-check"))]
+        self.state.erase(0, self.state.capacity() as u32)?;
+
+        // Set new magic
+        state_word.fill(magic);
+        self.state.write(0, state_word)?;
+        Ok(())
+    }
+
     fn read_state(&mut self, aligned_buf: &mut [u8]) -> Result<State, BootError> {
         let state_word = &mut aligned_buf[..STATE::WRITE_SIZE];
         self.state.read(0, state_word)?;
 
+        #[cfg(feature = "safe")]
+        if !state_word.iter().any(|&b| b != SAFE_MAGIC) {
+            return Ok(State::Safe);
+        }
         if !state_word.iter().any(|&b| b != SWAP_MAGIC) {
             Ok(State::Swap)
-        } else if !state_word.iter().any(|&b| b != DFU_DETACH_MAGIC) {
-            Ok(State::DfuDetach)
         } else if !state_word.iter().any(|&b| b != REVERT_MAGIC) {
             Ok(State::Revert)
         } else {
-            Ok(State::Boot)
+            #[cfg(feature = "restore")]
+            {
+                if !state_word.iter().any(|&b| b != BACKUP_MAGIC) {
+                    Ok(State::Backup)
+                } else if !state_word.iter().any(|&b| b != RECOVER_MAGIC) {
+                    Ok(State::Recover)
+                } else if !state_word.iter().any(|&b| b != DFU_DETACH_MAGIC) {
+                    Ok(State::DfuDetach)
+                } else {
+                    Ok(State::Boot)
+                }
+            }
+            #[cfg(not(feature = "restore"))]
+            {
+                if !state_word.iter().any(|&b| b != DFU_DETACH_MAGIC) {
+                    Ok(State::DfuDetach)
+                } else {
+                    Ok(State::Boot)
+                }
+            }
         }
+    }
+
+    /// Read the current reset count stored in the state partition.
+    #[cfg(feature = "reset-check")]
+    pub fn read_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u32, BootError> {
+        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
+        let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
+        self.state.read(offset, buf)?;
+        let bytes = core::cmp::min(STATE::WRITE_SIZE, 4);
+        if buf[..bytes].iter().all(|&b| b == STATE_ERASE_VALUE) {
+            return Ok(0);
+        }
+
+        let mut tmp = [0u8; 4];
+        tmp[..bytes].copy_from_slice(&buf[..bytes]);
+        Ok(u32::from_le_bytes(tmp))
+    }
+
+    /// Increment the reset count and store it back to flash.
+    #[cfg(feature = "reset-check")]
+    pub fn increment_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u32, BootError> {
+        let mut count = self.read_reset_count(aligned_buf)?;
+        count = count.wrapping_add(1);
+        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
+        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
+        self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
+
+        let bytes = count.to_le_bytes();
+        let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
+        buf.fill(0);
+        buf[..core::cmp::min(4, STATE::WRITE_SIZE)].copy_from_slice(&bytes[..core::cmp::min(4, STATE::WRITE_SIZE)]);
+        self.state.write(offset, buf)?;
+        Ok(count)
+    }
+
+    /// Clear the reset count to zero.
+    #[cfg(feature = "reset-check")]
+    pub fn clear_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
+        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
+        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
+        self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
+
+        let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
+        buf.fill(0);
+        self.state.write(offset, buf)?;
+        Ok(())
     }
 }
 
@@ -429,7 +713,18 @@ fn assert_partitions<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash>(
     assert_eq!(dfu.capacity() as u32 % page_size, 0);
     // DFU partition has to be bigger than ACTIVE partition to handle swap algorithm
     assert!(dfu.capacity() as u32 - active.capacity() as u32 >= page_size);
-    assert!(2 + 2 * (active.capacity() as u32 / page_size) <= state.capacity() as u32 / STATE::WRITE_SIZE as u32);
+    let required = {
+        let progress = TOTAL_PROGRESS_MARKS_PER_PAGE * (active.capacity() as u32 / page_size);
+        #[cfg(feature = "reset-check")]
+        {
+            2 + progress + (STATE::ERASE_SIZE as u32 / STATE::WRITE_SIZE as u32)
+        }
+        #[cfg(not(feature = "reset-check"))]
+        {
+            2 + progress
+        }
+    };
+    assert!(required <= state.capacity() as u32 / STATE::WRITE_SIZE as u32);
 }
 
 #[cfg(test)]

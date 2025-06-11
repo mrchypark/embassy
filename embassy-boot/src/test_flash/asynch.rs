@@ -1,3 +1,6 @@
+#![cfg(not(feature = "safe"))]
+
+use core::marker::PhantomData;
 use embassy_embedded_hal::flash::partition::Partition;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -58,6 +61,7 @@ where
             active: self.active.into_inner(),
             dfu: self.dfu.into_inner(),
             state: self.state.into_inner(),
+            _marker: PhantomData::<()>,
         };
         super::BlockingTestFlash::new(config)
     }

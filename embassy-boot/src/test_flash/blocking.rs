@@ -1,5 +1,8 @@
+#![cfg(not(feature = "safe"))]
+
 use core::cell::RefCell;
 
+use core::marker::PhantomData;
 use embassy_embedded_hal::flash::partition::BlockingPartition;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -62,6 +65,7 @@ where
             active: self.active.into_inner().into_inner(),
             dfu: self.dfu.into_inner().into_inner(),
             state: self.state.into_inner().into_inner(),
+            _marker: PhantomData::<()>,
         };
         super::AsyncTestFlash::new(config)
     }
