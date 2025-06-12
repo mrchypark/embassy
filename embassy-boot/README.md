@@ -60,6 +60,6 @@ firmware by calling `mark_backup()` and resetting. On the next boot the
 bootloader copies the active partition into the DFU partition while tracking
 progress to tolerate power loss before resuming the application.
 
-Similarly, calling `mark_recover()` instructs the bootloader to restore the
+Similarly, calling `mark_restore()` instructs the bootloader to restore the
 active partition from the DFU partition using the same progress tracking.
 

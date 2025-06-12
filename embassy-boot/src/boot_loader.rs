@@ -8,7 +8,7 @@ use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind};
 
 use crate::{State, BOOT_MAGIC, DFU_DETACH_MAGIC, REVERT_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC};
 #[cfg(feature = "restore")]
-use crate::{BACKUP_MAGIC, RECOVER_MAGIC};
+use crate::{BACKUP_MAGIC, RESTORE_MAGIC};
 
 /// Progress markers per page for each operation.
 const SWAP_PROGRESS_MARKS_PER_PAGE: u32 = 2;
@@ -16,7 +16,7 @@ const REVERT_PROGRESS_MARKS_PER_PAGE: u32 = 2;
 #[cfg(feature = "restore")]
 const BACKUP_PROGRESS_MARKS_PER_PAGE: u32 = 1;
 #[cfg(feature = "restore")]
-const RECOVER_PROGRESS_MARKS_PER_PAGE: u32 = 1;
+const RESTORE_PROGRESS_MARKS_PER_PAGE: u32 = 1;
 
 /// Base multipliers for calculating progress index slots within the state partition.
 const SWAP_PROGRESS_BASE: u32 = 0;
@@ -24,14 +24,14 @@ const REVERT_PROGRESS_BASE: u32 = SWAP_PROGRESS_BASE + SWAP_PROGRESS_MARKS_PER_P
 #[cfg(feature = "restore")]
 const BACKUP_PROGRESS_BASE: u32 = REVERT_PROGRESS_BASE + REVERT_PROGRESS_MARKS_PER_PAGE;
 #[cfg(feature = "restore")]
-const RECOVER_PROGRESS_BASE: u32 = BACKUP_PROGRESS_BASE + BACKUP_PROGRESS_MARKS_PER_PAGE;
+const RESTORE_PROGRESS_BASE: u32 = BACKUP_PROGRESS_BASE + BACKUP_PROGRESS_MARKS_PER_PAGE;
 #[cfg(not(feature = "restore"))]
 const TOTAL_PROGRESS_MARKS_PER_PAGE: u32 = SWAP_PROGRESS_MARKS_PER_PAGE + REVERT_PROGRESS_MARKS_PER_PAGE;
 #[cfg(feature = "restore")]
 const TOTAL_PROGRESS_MARKS_PER_PAGE: u32 = SWAP_PROGRESS_MARKS_PER_PAGE
     + REVERT_PROGRESS_MARKS_PER_PAGE
     + BACKUP_PROGRESS_MARKS_PER_PAGE
-    + RECOVER_PROGRESS_MARKS_PER_PAGE;
+    + RESTORE_PROGRESS_MARKS_PER_PAGE;
 #[cfg(feature = "safe")]
 use crate::SAFE_MAGIC;
 
@@ -421,9 +421,9 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
                 self.finalize(BOOT_MAGIC, aligned_buf)?;
                 return Ok(State::Boot);
             }
-            State::Recover => {
-                trace!("Recovering active partition");
-                self.recover(aligned_buf)?;
+            State::Restore => {
+                trace!("Restoring active partition");
+                self.restore(aligned_buf)?;
                 self.finalize(BOOT_MAGIC, aligned_buf)?;
                 return Ok(State::Boot);
             }
@@ -589,11 +589,11 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
     }
 
     #[cfg(feature = "restore")]
-    fn recover(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
+    fn restore(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
         let page_count = self.active.capacity() as u32 / Self::PAGE_SIZE;
         for page_num in 0..page_count {
             let progress_index =
-                (page_count * RECOVER_PROGRESS_BASE + page_num * RECOVER_PROGRESS_MARKS_PER_PAGE) as usize;
+                (page_count * RESTORE_PROGRESS_BASE + page_num * RESTORE_PROGRESS_MARKS_PER_PAGE) as usize;
             let offset = page_num * Self::PAGE_SIZE;
             self.copy_page_once_to_active(progress_index, offset, offset, aligned_buf)?;
         }
@@ -637,8 +637,8 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
             {
                 if !state_word.iter().any(|&b| b != BACKUP_MAGIC) {
                     Ok(State::Backup)
-                } else if !state_word.iter().any(|&b| b != RECOVER_MAGIC) {
-                    Ok(State::Recover)
+                } else if !state_word.iter().any(|&b| b != RESTORE_MAGIC) {
+                    Ok(State::Restore)
                 } else if !state_word.iter().any(|&b| b != DFU_DETACH_MAGIC) {
                     Ok(State::DfuDetach)
                 } else {

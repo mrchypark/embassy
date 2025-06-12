@@ -8,7 +8,7 @@ use embedded_storage_async::nor_flash::NorFlash;
 use super::FirmwareUpdaterConfig;
 use crate::{FirmwareUpdaterError, State, BOOT_MAGIC, DFU_DETACH_MAGIC, STATE_ERASE_VALUE, SWAP_MAGIC};
 #[cfg(feature = "restore")]
-use crate::{BACKUP_MAGIC, RECOVER_MAGIC};
+use crate::{BACKUP_MAGIC, RESTORE_MAGIC};
 
 /// FirmwareUpdater is an application API for interacting with the BootLoader without the ability to
 /// 'mess up' the internal bootloader state
@@ -195,9 +195,9 @@ impl<'d, DFU: NorFlash, STATE: NorFlash> FirmwareUpdater<'d, DFU, STATE> {
 
     /// Mark to trigger restore from the DFU partition on next boot.
     #[cfg(feature = "restore")]
-    pub async fn mark_recover(&mut self) -> Result<(), FirmwareUpdaterError> {
+    pub async fn mark_restore(&mut self) -> Result<(), FirmwareUpdaterError> {
         self.state.verify_booted().await?;
-        self.state.mark_recover().await
+        self.state.mark_restore().await
     }
 
     /// Mark firmware boot successful and stop rollback on reset.
@@ -357,8 +357,8 @@ impl<'d, STATE: NorFlash> FirmwareState<'d, STATE> {
 
     /// Mark to trigger restore from the DFU partition on next boot.
     #[cfg(feature = "restore")]
-    pub async fn mark_recover(&mut self) -> Result<(), FirmwareUpdaterError> {
-        self.set_magic(RECOVER_MAGIC).await
+    pub async fn mark_restore(&mut self) -> Result<(), FirmwareUpdaterError> {
+        self.set_magic(RESTORE_MAGIC).await
     }
 
     /// Read the 8-bit reset counter stored in flash.

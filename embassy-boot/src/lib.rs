@@ -32,7 +32,7 @@ pub(crate) const DFU_DETACH_MAGIC: u8 = 0xE0;
 #[cfg(feature = "restore")]
 pub(crate) const BACKUP_MAGIC: u8 = 0xA1;
 #[cfg(feature = "restore")]
-pub(crate) const RECOVER_MAGIC: u8 = 0xB0;
+pub(crate) const RESTORE_MAGIC: u8 = 0xB0;
 #[cfg(feature = "safe")]
 pub(crate) const SAFE_MAGIC: u8 = 0xA0;
 
@@ -53,8 +53,8 @@ pub enum State {
     /// Bootloader will copy the active partition to the dfu partition as a backup.
     Backup,
     #[cfg(feature = "restore")]
-    /// Bootloader will copy the dfu partition to the active partition to recover.
-    Recover,
+    /// Bootloader will copy the dfu partition to the active partition to restore.
+    Restore,
     /// Application has received a request to reboot into DFU mode to apply an update.
     DfuDetach,
 }
@@ -78,8 +78,8 @@ where
             {
                 if !magic.iter().any(|&b| b != BACKUP_MAGIC) {
                     State::Backup
-                } else if !magic.iter().any(|&b| b != RECOVER_MAGIC) {
-                    State::Recover
+                } else if !magic.iter().any(|&b| b != RESTORE_MAGIC) {
+                    State::Restore
                 } else if !magic.iter().any(|&b| b != DFU_DETACH_MAGIC) {
                     State::DfuDetach
                 } else {
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "restore")]
-    fn test_recover() {
+    fn test_restore() {
         const SIZE: usize = 8192;
         let flash = AsyncTestFlash::new(BootLoaderConfig {
             active: MemFlash::<SIZE, 4096, 4>::default(),
@@ -416,7 +416,7 @@ mod tests {
             },
             &mut aligned,
         );
-        block_on(updater.mark_recover()).unwrap();
+        block_on(updater.mark_restore()).unwrap();
 
         let flash = flash.into_blocking();
         let mut bootloader = BootLoader::new(BootLoaderConfig {
