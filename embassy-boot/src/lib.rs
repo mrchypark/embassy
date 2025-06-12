@@ -559,23 +559,50 @@ mod tests {
             state: MemFlash::<8192, 4096, 4>::default(),
             #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
+            _marker: PhantomData::<()>,
         });
 
         let mut bootloader = BootLoader::new(BootLoaderConfig {
             active: flash.active(),
             dfu: flash.dfu(),
             state: flash.state(),
+            _marker: PhantomData::<()>,
         });
 
         let mut aligned = [0; 4];
         bootloader.prepare_boot(&mut aligned).unwrap();
-        assert_eq!(1, bootloader.read_reset_count(&mut aligned).unwrap());
+        assert_eq!(1u8, bootloader.read_reset_count(&mut aligned).unwrap());
 
         bootloader.prepare_boot(&mut aligned).unwrap();
-        assert_eq!(2, bootloader.read_reset_count(&mut aligned).unwrap());
+        assert_eq!(2u8, bootloader.read_reset_count(&mut aligned).unwrap());
 
         let mut state = BlockingFirmwareState::new(flash.state(), &mut aligned);
         state.clear_reset_count().unwrap();
-        assert_eq!(0, state.read_reset_count().unwrap());
+        assert_eq!(0u8, state.read_reset_count().unwrap());
+    }
+
+    #[cfg(feature = "reset-check")]
+    #[test]
+    fn test_reset_counter_saturates() {
+        let flash = BlockingTestFlash::new(BootLoaderConfig {
+            active: MemFlash::<4096, 4096, 4>::default(),
+            dfu: MemFlash::<8192, 4096, 4>::default(),
+            state: MemFlash::<8192, 4096, 4>::default(),
+            _marker: PhantomData::<()>,
+        });
+
+        let mut bootloader = BootLoader::new(BootLoaderConfig {
+            active: flash.active(),
+            dfu: flash.dfu(),
+            state: flash.state(),
+            _marker: PhantomData::<()>,
+        });
+
+        let mut buf = [0; 4];
+        for _ in 0..300 {
+            bootloader.increment_reset_count(&mut buf).unwrap();
+        }
+
+        assert_eq!(u8::MAX, bootloader.read_reset_count(&mut buf).unwrap());
     }
 }

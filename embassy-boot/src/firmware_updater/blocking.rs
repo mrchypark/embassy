@@ -396,33 +396,48 @@ impl<'d, STATE: NorFlash> BlockingFirmwareState<'d, STATE> {
         self.set_magic(RECOVER_MAGIC)
     }
 
-    /// Read the reset counter stored in flash.
+    /// Read the 8-bit reset counter stored in flash.
     #[cfg(feature = "reset-check")]
-    pub fn read_reset_count(&mut self) -> Result<u32, FirmwareUpdaterError> {
+    pub fn read_reset_count(&mut self) -> Result<u8, FirmwareUpdaterError> {
         let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        self.state.read(offset, &mut self.aligned)?;
-        let bytes = core::cmp::min(STATE::WRITE_SIZE, 4);
-        if self.aligned[..bytes].iter().all(|&b| b == STATE_ERASE_VALUE) {
+        self.state.read(offset, &mut self.aligned[..STATE::WRITE_SIZE])?;
+        if self.aligned[..STATE::WRITE_SIZE]
+            .iter()
+            .all(|&b| b == STATE_ERASE_VALUE)
+        {
             return Ok(0);
         }
-        let mut tmp = [0u8; 4];
-        tmp[..bytes].copy_from_slice(&self.aligned[..bytes]);
-        Ok(u32::from_le_bytes(tmp))
+        if STATE::WRITE_SIZE >= 2 {
+            if self.aligned[1] == !self.aligned[0] {
+                Ok(self.aligned[0])
+            } else {
+                Ok(0)
+            }
+        } else if STATE::WRITE_SIZE == 1 {
+            Ok(self.aligned[0])
+        } else {
+            Ok(0)
+        }
     }
 
-    /// Increment the reset counter.
+    /// Increment the reset counter. Saturates at `u8::MAX`.
     #[cfg(feature = "reset-check")]
-    pub fn increment_reset_count(&mut self) -> Result<u32, FirmwareUpdaterError> {
+    pub fn increment_reset_count(&mut self) -> Result<u8, FirmwareUpdaterError> {
         let mut count = self.read_reset_count()?;
-        count = count.wrapping_add(1);
+        if count < u8::MAX {
+            count += 1;
+        }
         let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
         let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
         self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
 
         self.aligned.fill(0);
-        let bytes = count.to_le_bytes();
-        let copy = core::cmp::min(STATE::WRITE_SIZE, 4);
-        self.aligned[..copy].copy_from_slice(&bytes[..copy]);
+        if STATE::WRITE_SIZE >= 2 {
+            self.aligned[0] = count;
+            self.aligned[1] = !count;
+        } else {
+            self.aligned[0] = count;
+        }
         self.state.write(offset, &self.aligned)?;
         Ok(count)
     }
@@ -434,7 +449,7 @@ impl<'d, STATE: NorFlash> BlockingFirmwareState<'d, STATE> {
         let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
         self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
 
-        self.aligned.fill(0);
+        self.aligned.fill(STATE_ERASE_VALUE);
         self.state.write(offset, &self.aligned)?;
         Ok(())
     }

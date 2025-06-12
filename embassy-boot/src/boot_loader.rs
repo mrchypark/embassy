@@ -250,7 +250,7 @@ pub struct BootLoader<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE = (
     /// | 2..2 + N | Progress index used while swapping or reverting
     #[cfg_attr(
         feature = "reset-check",
-        doc = "| last-1..last | Reset count incremented on every boot"
+        doc = "| last-1..last | 8-bit reset count incremented on every boot"
     )]
     state: STATE,
     #[cfg(feature = "safe")]
@@ -656,35 +656,49 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
         }
     }
 
-    /// Read the current reset count stored in the state partition.
+    /// Read the 8-bit reset count stored in the state partition.
     #[cfg(feature = "reset-check")]
-    pub fn read_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u32, BootError> {
+    pub fn read_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u8, BootError> {
         let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
         let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
         self.state.read(offset, buf)?;
-        let bytes = core::cmp::min(STATE::WRITE_SIZE, 4);
-        if buf[..bytes].iter().all(|&b| b == STATE_ERASE_VALUE) {
+
+        if buf.iter().all(|&b| b == STATE_ERASE_VALUE) {
             return Ok(0);
         }
 
-        let mut tmp = [0u8; 4];
-        tmp[..bytes].copy_from_slice(&buf[..bytes]);
-        Ok(u32::from_le_bytes(tmp))
+        if STATE::WRITE_SIZE >= 2 {
+            if buf[1] == !buf[0] {
+                Ok(buf[0])
+            } else {
+                Ok(0)
+            }
+        } else if STATE::WRITE_SIZE == 1 {
+            Ok(buf[0])
+        } else {
+            Ok(0)
+        }
     }
 
-    /// Increment the reset count and store it back to flash.
+    /// Increment the reset count and store it back to flash. Saturates at `u8::MAX`.
     #[cfg(feature = "reset-check")]
-    pub fn increment_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u32, BootError> {
+    pub fn increment_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u8, BootError> {
         let mut count = self.read_reset_count(aligned_buf)?;
-        count = count.wrapping_add(1);
+        if count < u8::MAX {
+            count += 1;
+        }
         let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
         let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
         self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
 
-        let bytes = count.to_le_bytes();
         let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
         buf.fill(0);
-        buf[..core::cmp::min(4, STATE::WRITE_SIZE)].copy_from_slice(&bytes[..core::cmp::min(4, STATE::WRITE_SIZE)]);
+        if buf.len() >= 2 {
+            buf[0] = count;
+            buf[1] = !count;
+        } else {
+            buf[0] = count;
+        }
         self.state.write(offset, buf)?;
         Ok(count)
     }
@@ -697,7 +711,7 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
         self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
 
         let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
-        buf.fill(0);
+        buf.fill(STATE_ERASE_VALUE);
         self.state.write(offset, buf)?;
         Ok(())
     }
