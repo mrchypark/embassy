@@ -35,6 +35,9 @@ const TOTAL_PROGRESS_MARKS_PER_PAGE: u32 = SWAP_PROGRESS_MARKS_PER_PAGE
 #[cfg(feature = "safe")]
 use crate::SAFE_MAGIC;
 
+#[cfg(feature = "reset-check")]
+const RESET_COUNT_MAX: u32 = u8::MAX as u32;
+
 /// Errors returned by bootloader
 #[derive(PartialEq, Eq, Debug)]
 pub enum BootError {
@@ -250,7 +253,7 @@ pub struct BootLoader<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE = (
     /// | 2..2 + N | Progress index used while swapping or reverting
     #[cfg_attr(
         feature = "reset-check",
-        doc = "| last-1..last | 8-bit reset count incremented on every boot"
+        doc = "| capacity-ERASE_SIZE..capacity | 8-bit reset count incremented on every boot"
     )]
     state: STATE,
     #[cfg(feature = "safe")]
@@ -402,10 +405,6 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
                 state_word.fill(!STATE_ERASE_VALUE);
                 self.state.write(STATE::WRITE_SIZE as u32, state_word)?;
 
-                #[cfg(feature = "reset-check")]
-                self.state
-                    .erase(0, self.state.capacity() as u32 - STATE::ERASE_SIZE as u32)?;
-                #[cfg(not(feature = "reset-check"))]
                 self.state.erase(0, self.state.capacity() as u32)?;
 
                 // Set magic
@@ -608,10 +607,6 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
         self.state.write(STATE::WRITE_SIZE as u32, state_word)?;
 
         // Clear magic and progress
-        #[cfg(feature = "reset-check")]
-        self.state
-            .erase(0, self.state.capacity() as u32 - STATE::ERASE_SIZE as u32)?;
-        #[cfg(not(feature = "reset-check"))]
         self.state.erase(0, self.state.capacity() as u32)?;
 
         // Set new magic
@@ -659,61 +654,41 @@ impl<ACTIVE: NorFlash, DFU: NorFlash, STATE: NorFlash, SAFE> BootLoader<ACTIVE, 
     /// Read the 8-bit reset count stored in the state partition.
     #[cfg(feature = "reset-check")]
     pub fn read_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u8, BootError> {
-        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
-        self.state.read(offset, buf)?;
+        let write_size = STATE::WRITE_SIZE as u32;
+        let base_offset = self.state.capacity() as u32 - STATE::ERASE_SIZE as u32;
 
-        if buf.iter().all(|&b| b == STATE_ERASE_VALUE) {
-            return Ok(0);
-        }
-
-        if STATE::WRITE_SIZE >= 2 {
-            if buf[1] == !buf[0] {
-                Ok(buf[0])
-            } else {
-                Ok(0)
+        for i in 0..RESET_COUNT_MAX {
+            let offset = base_offset + i * write_size;
+            if offset > self.state.capacity() as u32 - write_size {
+                return Ok(i as u8);
             }
-        } else if STATE::WRITE_SIZE == 1 {
-            Ok(buf[0])
-        } else {
-            Ok(0)
+            self.state.read(offset, &mut aligned_buf[..STATE::WRITE_SIZE])?;
+
+            if aligned_buf[..STATE::WRITE_SIZE].iter().all(|&b| b == STATE_ERASE_VALUE) {
+                return Ok(i as u8);
+            }
         }
+        Ok(RESET_COUNT_MAX as u8)
     }
 
     /// Increment the reset count and store it back to flash. Saturates at `u8::MAX`.
     #[cfg(feature = "reset-check")]
     pub fn increment_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<u8, BootError> {
-        let mut count = self.read_reset_count(aligned_buf)?;
-        if count < u8::MAX {
-            count += 1;
-        }
-        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
-        self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
+        let count = self.read_reset_count(aligned_buf)?;
 
-        let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
-        buf.fill(0);
-        if buf.len() >= 2 {
-            buf[0] = count;
-            buf[1] = !count;
+        if count < RESET_COUNT_MAX as u8 {
+            let write_size = STATE::WRITE_SIZE as u32;
+            let base_offset = self.state.capacity() as u32 - STATE::ERASE_SIZE as u32;
+            let offset_to_mark = base_offset + (count as u32) * write_size;
+
+            let state_word = &mut aligned_buf[..STATE::WRITE_SIZE];
+            state_word.fill(!STATE_ERASE_VALUE);
+            self.state.write(offset_to_mark, state_word)?;
+
+            Ok(count + 1)
         } else {
-            buf[0] = count;
+            Ok(count)
         }
-        self.state.write(offset, buf)?;
-        Ok(count)
-    }
-
-    /// Clear the reset count to zero.
-    #[cfg(feature = "reset-check")]
-    pub fn clear_reset_count(&mut self, aligned_buf: &mut [u8]) -> Result<(), BootError> {
-        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
-        self.state.erase(page_start, page_start + STATE::ERASE_SIZE as u32)?;
-
-        let buf = &mut aligned_buf[..STATE::WRITE_SIZE];
-        buf.fill(STATE_ERASE_VALUE);
-        self.state.write(offset, buf)?;
-        Ok(())
     }
 }
 

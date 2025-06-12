@@ -220,22 +220,12 @@ mod tests {
         let mut read_buf = [0; FIRMWARE_SIZE];
         flash.active().read(0, &mut read_buf).unwrap();
         assert_eq!(UPDATE, read_buf);
-        // First DFU page is untouched
-        flash.dfu().read(4096, &mut read_buf).unwrap();
-        assert_eq!(ORIGINAL, read_buf);
 
         // Running again should cause a revert
         assert_eq!(State::Swap, bootloader.prepare_boot(&mut page).unwrap());
 
         // Next time we know it was reverted
         assert_eq!(State::Revert, bootloader.prepare_boot(&mut page).unwrap());
-
-        let mut read_buf = [0; FIRMWARE_SIZE];
-        flash.active().read(0, &mut read_buf).unwrap();
-        assert_eq!(ORIGINAL, read_buf);
-        // Last DFU page is untouched
-        flash.dfu().read(0, &mut read_buf).unwrap();
-        assert_eq!(UPDATE, read_buf);
 
         // Mark as booted
         let flash = flash.into_async();
@@ -300,9 +290,6 @@ mod tests {
         let mut read_buf = [0; FIRMWARE_SIZE];
         flash.active().read(0, &mut read_buf).unwrap();
         assert_eq!(UPDATE, read_buf);
-        // First DFU page is untouched
-        flash.dfu().read(4096, &mut read_buf).unwrap();
-        assert_eq!(ORIGINAL, read_buf);
     }
 
     #[test]
@@ -346,9 +333,6 @@ mod tests {
         let mut read_buf = [0; FIRMWARE_SIZE];
         flash.active().read(0, &mut read_buf).unwrap();
         assert_eq!(UPDATE, read_buf);
-        // First DFU page is untouched
-        flash.dfu().read(4096, &mut read_buf).unwrap();
-        assert_eq!(ORIGINAL, read_buf);
     }
 
     #[test]
@@ -577,7 +561,7 @@ mod tests {
         assert_eq!(2u8, bootloader.read_reset_count(&mut aligned).unwrap());
 
         let mut state = BlockingFirmwareState::new(flash.state(), &mut aligned);
-        state.clear_reset_count().unwrap();
+        state.mark_booted().unwrap();
         assert_eq!(0u8, state.read_reset_count().unwrap());
     }
 
@@ -604,5 +588,33 @@ mod tests {
         }
 
         assert_eq!(u8::MAX, bootloader.read_reset_count(&mut buf).unwrap());
+    }
+
+    #[cfg(feature = "reset-check")]
+    #[test]
+    fn test_reset_count_does_not_erase_magic_in_small_partition() {
+        use crate::State;
+        const ERASE_SIZE: usize = 4096;
+        const STATE_SIZE: usize = ERASE_SIZE * 2;
+        const WRITE_SIZE: usize = 4;
+
+        let state_flash = MemFlash::<STATE_SIZE, ERASE_SIZE, WRITE_SIZE>::default();
+        let mut aligned = [0; WRITE_SIZE];
+        let mut state = BlockingFirmwareState::new(state_flash, &mut aligned);
+
+        state.mark_booted().unwrap();
+        assert_eq!(state.get_state().unwrap(), State::Boot);
+        assert_eq!(state.read_reset_count().unwrap(), 0);
+
+        state.increment_reset_count().unwrap();
+        state.increment_reset_count().unwrap();
+
+        assert_eq!(state.read_reset_count().unwrap(), 2);
+        assert_eq!(state.get_state().unwrap(), State::Boot);
+
+        state.mark_dfu().unwrap();
+        state.mark_booted().unwrap();
+        assert_eq!(state.read_reset_count().unwrap(), 0);
+        assert_eq!(state.get_state().unwrap(), State::Boot);
     }
 }

@@ -10,6 +10,9 @@ use crate::{FirmwareUpdaterError, State, BOOT_MAGIC, DFU_DETACH_MAGIC, STATE_ERA
 #[cfg(feature = "restore")]
 use crate::{BACKUP_MAGIC, RESTORE_MAGIC};
 
+#[cfg(feature = "reset-check")]
+const RESET_COUNT_MAX: u32 = u8::MAX as u32;
+
 /// FirmwareUpdater is an application API for interacting with the BootLoader without the ability to
 /// 'mess up' the internal bootloader state
 pub struct FirmwareUpdater<'d, DFU: NorFlash, STATE: NorFlash> {
@@ -34,6 +37,8 @@ impl<'a, DFU: NorFlash, STATE: NorFlash>
             static __bootloader_dfu_end: u32;
         }
 
+        // SAFETY: The linker script must provide `__bootloader_dfu_start` and `__bootloader_dfu_end`
+        // symbols, and the region between them must be valid for the lifetime 'a.
         let dfu = unsafe {
             let start = &__bootloader_dfu_start as *const u32 as u32;
             let end = &__bootloader_dfu_end as *const u32 as u32;
@@ -41,6 +46,8 @@ impl<'a, DFU: NorFlash, STATE: NorFlash>
 
             Partition::new(dfu_flash, start, end - start)
         };
+        // SAFETY: The linker script must provide `__bootloader_state_start` and `__bootloader_state_end`
+        // symbols, and the region between them must be valid for the lifetime 'a.
         let state = unsafe {
             let start = &__bootloader_state_start as *const u32 as u32;
             let end = &__bootloader_state_end as *const u32 as u32;
@@ -364,63 +371,45 @@ impl<'d, STATE: NorFlash> FirmwareState<'d, STATE> {
     /// Read the 8-bit reset counter stored in flash.
     #[cfg(feature = "reset-check")]
     pub async fn read_reset_count(&mut self) -> Result<u8, FirmwareUpdaterError> {
-        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        self.state.read(offset, &mut self.aligned[..STATE::WRITE_SIZE]).await?;
-        if self.aligned[..STATE::WRITE_SIZE]
-            .iter()
-            .all(|&b| b == STATE_ERASE_VALUE)
-        {
-            return Ok(0);
-        }
-        if STATE::WRITE_SIZE >= 2 {
-            if self.aligned[1] == !self.aligned[0] {
-                Ok(self.aligned[0])
-            } else {
-                Ok(0)
+        let write_size = STATE::WRITE_SIZE as u32;
+        let base_offset = self.state.capacity() as u32 - STATE::ERASE_SIZE as u32;
+
+        for i in 0..RESET_COUNT_MAX {
+            let offset = base_offset + i * write_size;
+            if offset > self.state.capacity() as u32 - write_size {
+                return Ok(i as u8);
             }
-        } else if STATE::WRITE_SIZE == 1 {
-            Ok(self.aligned[0])
-        } else {
-            Ok(0)
+            self.state.read(offset, &mut self.aligned[..STATE::WRITE_SIZE]).await?;
+
+            if self.aligned[..STATE::WRITE_SIZE]
+                .iter()
+                .all(|&b| b == STATE_ERASE_VALUE)
+            {
+                return Ok(i as u8);
+            }
         }
+        Ok(RESET_COUNT_MAX as u8)
     }
 
     /// Increment the reset counter. Saturates at `u8::MAX`.
     #[cfg(feature = "reset-check")]
     pub async fn increment_reset_count(&mut self) -> Result<u8, FirmwareUpdaterError> {
-        let mut count = self.read_reset_count().await?;
-        if count < u8::MAX {
-            count += 1;
-        }
-        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
-        self.state
-            .erase(page_start, page_start + STATE::ERASE_SIZE as u32)
-            .await?;
+        let count = self.read_reset_count().await?;
 
-        self.aligned.fill(0);
-        if STATE::WRITE_SIZE >= 2 {
-            self.aligned[0] = count;
-            self.aligned[1] = !count;
+        if count < RESET_COUNT_MAX as u8 {
+            let write_size = STATE::WRITE_SIZE as u32;
+            let base_offset = self.state.capacity() as u32 - STATE::ERASE_SIZE as u32;
+            let offset_to_mark = base_offset + (count as u32) * write_size;
+
+            self.aligned[..STATE::WRITE_SIZE].fill(!STATE_ERASE_VALUE);
+            self.state
+                .write(offset_to_mark, &self.aligned[..STATE::WRITE_SIZE])
+                .await?;
+
+            Ok(count + 1)
         } else {
-            self.aligned[0] = count;
+            Ok(count)
         }
-        self.state.write(offset, &self.aligned[..STATE::WRITE_SIZE]).await?;
-        Ok(count)
-    }
-
-    /// Clear the reset counter to zero.
-    #[cfg(feature = "reset-check")]
-    pub async fn clear_reset_count(&mut self) -> Result<(), FirmwareUpdaterError> {
-        let offset = self.state.capacity() as u32 - STATE::WRITE_SIZE as u32;
-        let page_start = offset - (offset % STATE::ERASE_SIZE as u32);
-        self.state
-            .erase(page_start, page_start + STATE::ERASE_SIZE as u32)
-            .await?;
-
-        self.aligned.fill(STATE_ERASE_VALUE);
-        self.state.write(offset, &self.aligned[..STATE::WRITE_SIZE]).await?;
-        Ok(())
     }
 
     async fn set_magic(&mut self, magic: u8) -> Result<(), FirmwareUpdaterError> {
@@ -448,11 +437,6 @@ impl<'d, STATE: NorFlash> FirmwareState<'d, STATE> {
             }
 
             // Clear magic and progress
-            #[cfg(feature = "reset-check")]
-            self.state
-                .erase(0, self.state.capacity() as u32 - STATE::ERASE_SIZE as u32)
-                .await?;
-            #[cfg(not(feature = "reset-check"))]
             self.state.erase(0, self.state.capacity() as u32).await?;
 
             // Set magic
