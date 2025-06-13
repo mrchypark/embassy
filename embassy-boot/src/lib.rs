@@ -151,9 +151,6 @@ mod tests {
         let flash = BlockingTestFlash::new(BootLoaderConfig {
             active: MemFlash::<57344, 4096, 4>::default(),
             dfu: MemFlash::<61440, 4096, 4>::default(),
-            #[cfg(feature = "reset-check")]
-            state: MemFlash::<8192, 4096, 4>::default(),
-            #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
             _marker: PhantomData::<()>,
         });
@@ -178,9 +175,6 @@ mod tests {
         let flash = AsyncTestFlash::new(BootLoaderConfig {
             active: MemFlash::<FIRMWARE_SIZE, 4096, 4>::default(),
             dfu: MemFlash::<61440, 4096, 4>::default(),
-            #[cfg(feature = "reset-check")]
-            state: MemFlash::<8192, 4096, 4>::default(),
-            #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
             _marker: PhantomData::<()>,
         });
@@ -441,9 +435,6 @@ mod tests {
         let flash = BlockingTestFlash::new(BootLoaderConfig {
             active: MemFlash::<0, 0, 0>::default(),
             dfu: MemFlash::<4096, 4096, 4>::default(),
-            #[cfg(feature = "reset-check")]
-            state: MemFlash::<8192, 4096, 4>::default(),
-            #[cfg(not(feature = "reset-check"))]
             state: MemFlash::<4096, 4096, 4>::default(),
             _marker: PhantomData::<()>,
         });
@@ -532,89 +523,5 @@ mod tests {
 
         let mut page = [0; 4096];
         assert_eq!(State::Boot, bootloader.prepare_boot(&mut page).unwrap());
-    }
-    #[cfg(feature = "reset-check")]
-    #[test]
-    fn test_reset_counter() {
-        let flash = BlockingTestFlash::new(BootLoaderConfig {
-            active: MemFlash::<4096, 4096, 4>::default(),
-            dfu: MemFlash::<8192, 4096, 4>::default(),
-            #[cfg(feature = "reset-check")]
-            state: MemFlash::<8192, 4096, 4>::default(),
-            #[cfg(not(feature = "reset-check"))]
-            state: MemFlash::<4096, 4096, 4>::default(),
-            _marker: PhantomData::<()>,
-        });
-
-        let mut bootloader = BootLoader::new(BootLoaderConfig {
-            active: flash.active(),
-            dfu: flash.dfu(),
-            state: flash.state(),
-            _marker: PhantomData::<()>,
-        });
-
-        let mut aligned = [0; 4];
-        bootloader.prepare_boot(&mut aligned).unwrap();
-        assert_eq!(1u8, bootloader.read_reset_count(&mut aligned).unwrap());
-
-        bootloader.prepare_boot(&mut aligned).unwrap();
-        assert_eq!(2u8, bootloader.read_reset_count(&mut aligned).unwrap());
-
-        let mut state = BlockingFirmwareState::new(flash.state(), &mut aligned);
-        state.mark_booted().unwrap();
-        assert_eq!(0u8, state.read_reset_count().unwrap());
-    }
-
-    #[cfg(feature = "reset-check")]
-    #[test]
-    fn test_reset_counter_saturates() {
-        let flash = BlockingTestFlash::new(BootLoaderConfig {
-            active: MemFlash::<4096, 4096, 4>::default(),
-            dfu: MemFlash::<8192, 4096, 4>::default(),
-            state: MemFlash::<8192, 4096, 4>::default(),
-            _marker: PhantomData::<()>,
-        });
-
-        let mut bootloader = BootLoader::new(BootLoaderConfig {
-            active: flash.active(),
-            dfu: flash.dfu(),
-            state: flash.state(),
-            _marker: PhantomData::<()>,
-        });
-
-        let mut buf = [0; 4];
-        for _ in 0..300 {
-            bootloader.increment_reset_count(&mut buf).unwrap();
-        }
-
-        assert_eq!(u8::MAX, bootloader.read_reset_count(&mut buf).unwrap());
-    }
-
-    #[cfg(feature = "reset-check")]
-    #[test]
-    fn test_reset_count_does_not_erase_magic_in_small_partition() {
-        use crate::State;
-        const ERASE_SIZE: usize = 4096;
-        const STATE_SIZE: usize = ERASE_SIZE * 2;
-        const WRITE_SIZE: usize = 4;
-
-        let state_flash = MemFlash::<STATE_SIZE, ERASE_SIZE, WRITE_SIZE>::default();
-        let mut aligned = [0; WRITE_SIZE];
-        let mut state = BlockingFirmwareState::new(state_flash, &mut aligned);
-
-        state.mark_booted().unwrap();
-        assert_eq!(state.get_state().unwrap(), State::Boot);
-        assert_eq!(state.read_reset_count().unwrap(), 0);
-
-        state.increment_reset_count().unwrap();
-        state.increment_reset_count().unwrap();
-
-        assert_eq!(state.read_reset_count().unwrap(), 2);
-        assert_eq!(state.get_state().unwrap(), State::Boot);
-
-        state.mark_dfu().unwrap();
-        state.mark_booted().unwrap();
-        assert_eq!(state.read_reset_count().unwrap(), 0);
-        assert_eq!(state.get_state().unwrap(), State::Boot);
     }
 }

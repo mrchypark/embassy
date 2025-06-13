@@ -44,3 +44,5 @@ defmt = [
 softdevice = [
     "nrf-softdevice-mbr",
 ]
+restore = ["embassy-boot/restore"]
+safe = ["embassy-boot/safe"]

@@ -9,6 +9,8 @@ An adaptation of `embassy-boot` for nRF.
 - Load applications with or without the softdevice.
 - Configure bootloader partitions based on linker script.
 - Using watchdog timer to detect application failure.
+- Optional `restore` feature enables backing up and restoring the active partition.
+- Optional `safe` feature boots a known-good firmware image when requested.
 
 ## Working with a SoftDevice
 

@@ -41,16 +41,6 @@ The bootloader supports different hardware in separate crates:
 * `embassy-boot-rp` - for the RP2040 microcontrollers.
 * `embassy-boot-stm32` - for the STM32 microcontrollers.
 
-## Reset check
-
-The bootloader keeps track of how many times it has restarted without the
-application confirming a successful boot. The counter is stored as an 8‑bit
-value in the bootloader state partition and is incremented on every boot. The
-value saturates at 255. Applications can inspect and reset this counter through
-the `FirmwareState` API. This functionality is behind the optional
-`reset-check` feature.
-
-
 ## Backup and Restore
 The optional `restore` feature enables power-loss safe backup and restoration
 of the active partition.
